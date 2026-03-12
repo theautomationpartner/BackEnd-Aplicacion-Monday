@@ -1,0 +1,22 @@
+{
+  "name": "afip-monday-backend",
+  "version": "1.0.0",
+  "description": "Backend para Facturación Electrónica AFIP - Monday App",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "multer": "^2.1.1",
+    "pg": "^8.13.3",
+    "serverless-http": "^4.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}

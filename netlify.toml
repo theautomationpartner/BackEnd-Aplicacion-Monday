@@ -1,0 +1,20 @@
+[build]
+  command = "npm install"
+  functions = "netlify/functions"
+  publish = "public"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["pg", "crypto-js", "serverless-http", "express", "cors", "body-parser", "multer", "dotenv"]
+
+[[redirects]]
+  # Redirigir la raíz al punto de salud para verificar fácilmente
+  from = "/"
+  to = "/.netlify/functions/server/api/health"
+  status = 200
+
+  # Todas las rutas de API a la función
+  from = "/api/*"
+  to = "/.netlify/functions/server/api/*"
+  status = 200
+  force = true
