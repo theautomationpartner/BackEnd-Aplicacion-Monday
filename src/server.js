@@ -53,8 +53,12 @@ app.post('/api/companies', async (req, res) => {
         const result = await db.query(query, [monday_account_id, business_name, cuit, iva_condition, default_point_of_sale, domicilio, fecha_inicio]);
         res.json(result.rows[0]);
     } catch (err) {
-        console.error("Error en DB:", err);
-        res.status(500).json({ error: 'Error al guardar los datos fiscales' });
+        console.error("❌ Error en DB:", err);
+        res.status(500).json({ 
+            error: 'Error al guardar los datos fiscales',
+            details: err.message,
+            code: err.code 
+        });
     }
 });
 
@@ -101,8 +105,12 @@ app.post('/api/certificates', upload.fields([
 
         res.json({ message: 'Certificados guardados en DB y clave encriptada correctamente' });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error al procesar certificados' });
+        console.error("❌ Error al procesar certificados:", err);
+        res.status(500).json({ 
+            error: 'Error al procesar certificados',
+            details: err.message,
+            code: err.code
+        });
     }
 });
 
