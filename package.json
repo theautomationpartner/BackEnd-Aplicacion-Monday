@@ -8,6 +8,7 @@
     "dev": "nodemon src/server.js"
   },
   "dependencies": {
+    "aplicacion-de-monday": "file:..",
     "cors": "^2.8.6",
     "crypto-js": "^4.2.0",
     "dotenv": "^17.3.1",
