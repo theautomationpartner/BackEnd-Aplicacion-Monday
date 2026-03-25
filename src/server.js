@@ -35,6 +35,14 @@ app.get('/api/health', async (req, res) => {
 
 app.get('/api/setup/:mondayAccountId', async (req, res) => {
     const { mondayAccountId } = req.params;
+    const { board_id, view_id, app_feature_id } = req.query;
+
+    console.log('🔎 setup request', {
+        mondayAccountId,
+        board_id: board_id || null,
+        view_id: view_id || null,
+        app_feature_id: app_feature_id || null
+    });
 
     try {
         const companyQuery = `
@@ -50,7 +58,13 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
                 hasFiscalData: false,
                 hasCertificates: false,
                 fiscalData: null,
-                certificates: null
+                certificates: null,
+                identifiers: {
+                    monday_account_id: mondayAccountId,
+                    board_id: board_id || null,
+                    view_id: view_id || null,
+                    app_feature_id: app_feature_id || null
+                }
             });
         }
 
@@ -71,7 +85,13 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
                 domicilio: company.address || '',
                 fecha_inicio: company.start_date || ''
             },
-            certificates: certResult.rows[0] || null
+            certificates: certResult.rows[0] || null,
+            identifiers: {
+                monday_account_id: mondayAccountId,
+                board_id: board_id || null,
+                view_id: view_id || null,
+                app_feature_id: app_feature_id || null
+            }
         });
     } catch (err) {
         console.error('❌ Error al consultar setup inicial:', err);
