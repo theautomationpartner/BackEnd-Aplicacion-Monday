@@ -33,6 +33,52 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
+app.get('/api/setup/:mondayAccountId', async (req, res) => {
+    const { mondayAccountId } = req.params;
+
+    try {
+        const companyQuery = `
+            SELECT id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date
+            FROM companies
+            WHERE monday_account_id = $1
+            LIMIT 1;
+        `;
+        const companyResult = await db.query(companyQuery, [mondayAccountId]);
+
+        if (companyResult.rows.length === 0) {
+            return res.json({
+                hasFiscalData: false,
+                hasCertificates: false,
+                fiscalData: null,
+                certificates: null
+            });
+        }
+
+        const company = companyResult.rows[0];
+        const certResult = await db.query(
+            'SELECT expiration_date FROM afip_credentials WHERE company_id = $1 LIMIT 1',
+            [company.id]
+        );
+
+        res.json({
+            hasFiscalData: true,
+            hasCertificates: certResult.rows.length > 0,
+            fiscalData: {
+                business_name: company.business_name || '',
+                cuit: company.cuit || '',
+                iva_condition: company.iva_condition || '',
+                default_point_of_sale: company.default_point_of_sale || '',
+                domicilio: company.address || '',
+                fecha_inicio: company.start_date || ''
+            },
+            certificates: certResult.rows[0] || null
+        });
+    } catch (err) {
+        console.error('❌ Error al consultar setup inicial:', err);
+        res.status(500).json({ error: 'Error al consultar datos guardados' });
+    }
+});
+
 app.post('/api/companies', async (req, res) => {
     const { monday_account_id, business_name, cuit, iva_condition, default_point_of_sale, domicilio, fecha_inicio } = req.body;
     try {
