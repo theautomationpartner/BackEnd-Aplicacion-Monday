@@ -42,6 +42,13 @@ function getSessionSecret() {
     return process.env.MONDAY_CLIENT_SECRET || process.env.MONDAY_SIGNING_SECRET || process.env.CLIENT_SECRET;
 }
 
+const COMPROBANTE_STATUS_FLOW = {
+    trigger: 'Crear Comprobante',
+    processing: 'Creando Comprobante',
+    success: 'Comprobante Creado',
+    error: 'Error - Mirar Comentarios',
+};
+
 function parseAuthorizationToken(req) {
     const authHeader = req.headers.authorization || req.headers.Authorization;
     if (!authHeader || typeof authHeader !== 'string') return null;
@@ -189,9 +196,10 @@ app.get('/api/setup/:mondayAccountId', requireMondaySession, async (req, res) =>
                     const row = boardConfigResult.rows[0];
                     boardConfig = {
                         status_column_id: row.status_column_id || '',
-                        trigger_label: row.trigger_label || 'Crear Factura',
-                        success_label: row.success_label || 'Emitida',
-                        error_label: row.error_label || 'Error',
+                        trigger_label: row.trigger_label || COMPROBANTE_STATUS_FLOW.trigger,
+                        processing_label: COMPROBANTE_STATUS_FLOW.processing,
+                        success_label: row.success_label || COMPROBANTE_STATUS_FLOW.success,
+                        error_label: row.error_label || COMPROBANTE_STATUS_FLOW.error,
                         required_columns: row.required_columns_json || [],
                         updated_at: row.updated_at || null
                     };
@@ -267,9 +275,10 @@ app.get('/api/board-config/:mondayAccountId', requireMondaySession, async (req, 
             config: {
                 id: row.id,
                 status_column_id: row.status_column_id || '',
-                trigger_label: row.trigger_label || 'Crear Factura',
-                success_label: row.success_label || 'Emitida',
-                error_label: row.error_label || 'Error',
+                trigger_label: row.trigger_label || COMPROBANTE_STATUS_FLOW.trigger,
+                processing_label: COMPROBANTE_STATUS_FLOW.processing,
+                success_label: row.success_label || COMPROBANTE_STATUS_FLOW.success,
+                error_label: row.error_label || COMPROBANTE_STATUS_FLOW.error,
                 required_columns: row.required_columns_json || [],
                 updated_at: row.updated_at || null
             }
@@ -293,9 +302,6 @@ app.post('/api/board-config', requireMondaySession, async (req, res) => {
         view_id,
         app_feature_id,
         status_column_id,
-        trigger_label,
-        success_label,
-        error_label,
         required_columns
     } = req.body;
 
@@ -336,9 +342,9 @@ app.post('/api/board-config', requireMondaySession, async (req, res) => {
                 view_id || null,
                 app_feature_id || null,
                 String(status_column_id),
-                (trigger_label || 'Crear Factura').trim(),
-                (success_label || 'Emitida').trim(),
-                (error_label || 'Error').trim(),
+                COMPROBANTE_STATUS_FLOW.trigger,
+                COMPROBANTE_STATUS_FLOW.success,
+                COMPROBANTE_STATUS_FLOW.error,
                 JSON.stringify(required_columns)
             ]
         );
@@ -366,9 +372,9 @@ app.post('/api/board-config', requireMondaySession, async (req, res) => {
                 view_id || null,
                 app_feature_id || null,
                 String(status_column_id),
-                (trigger_label || 'Crear Factura').trim(),
-                (success_label || 'Emitida').trim(),
-                (error_label || 'Error').trim(),
+                COMPROBANTE_STATUS_FLOW.trigger,
+                COMPROBANTE_STATUS_FLOW.success,
+                COMPROBANTE_STATUS_FLOW.error,
                 JSON.stringify(required_columns)
             ]
         );
