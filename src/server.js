@@ -88,6 +88,7 @@ function requireMondaySession(req, res, next) {
 
 function ensureAccountMatch(req, res, providedAccountId) {
     if (!req.mondayIdentity?.accountId || !providedAccountId) {
+        res.status(401).json({ error: 'No se pudo validar la cuenta monday desde sessionToken' });
         return false;
     }
 
