@@ -117,6 +117,51 @@ function isValidHttpsUrl(value) {
     }
 }
 
+async function mondayApiRequest(query, variables = {}) {
+    const mondayApiToken = (process.env.MONDAY_API_TOKEN || '').trim();
+    if (!mondayApiToken) {
+        throw new Error('Falta MONDAY_API_TOKEN para consultar datos en monday');
+    }
+
+    const response = await fetch('https://api.monday.com/v2', {
+        method: 'POST',
+        headers: {
+            Authorization: mondayApiToken,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || data?.errors?.length) {
+        const details = data?.errors?.map((err) => err.message).join(' | ') || response.statusText;
+        throw new Error(`Error monday API: ${details}`);
+    }
+
+    return data?.data;
+}
+
+function toNumberOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const normalized = String(value).trim().replace(',', '.');
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getColumnTextById(columnValues, columnId) {
+    if (!columnId) return '';
+    const found = (columnValues || []).find((column) => column.id === columnId);
+    return found?.text || '';
+}
+
+function sumLineTotals(lines) {
+    return lines.reduce((acc, line) => {
+        const quantity = toNumberOrNull(line.quantity) || 0;
+        const unitPrice = toNumberOrNull(line.unit_price) || 0;
+        return acc + (quantity * unitPrice);
+    }, 0);
+}
+
 // --- RUTAS ---
 
 app.get('/api/health', async (req, res) => {
@@ -638,8 +683,7 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
     const {
         monday_account_id,
         board_id,
-        item_id,
-        webhook_url
+        item_id
     } = req.body;
 
     const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
@@ -652,62 +696,127 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
 
     if (!ensureAccountMatch(req, res, accountId)) return;
 
-    const configuredWebhookUrl = String(webhook_url || process.env.MAKE_WEBHOOK_FACTURA_C_URL || '').trim();
-    if (!isValidHttpsUrl(configuredWebhookUrl)) {
-        return res.status(400).json({
-            error: 'Falta webhook válido de Make para Factura C. Enviá webhook_url o configurá MAKE_WEBHOOK_FACTURA_C_URL'
-        });
-    }
-
     try {
         const company = await getCompanyByMondayAccountId(accountId);
         if (!company) {
             return res.status(404).json({ error: 'Empresa no encontrada para la cuenta monday' });
         }
 
-        const payload = {
-            event: {
-                pulseId: Number(itemId),
-                boardId: Number(boardId),
-                accountId: Number(accountId),
-                userId: req.mondayIdentity?.userId ? Number(req.mondayIdentity.userId) : null,
-                triggerTime: new Date().toISOString(),
-            },
-            factura: {
-                tipo: 'C',
-                statusFlow: COMPROBANTE_STATUS_FLOW,
-            },
-            source: 'tap-monday-app',
-        };
-
-        const makeResponse = await fetch(configuredWebhookUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload),
-        });
-
-        const rawBody = await makeResponse.text();
-        if (!makeResponse.ok) {
-            return res.status(502).json({
-                error: 'Make respondió con error al disparar Factura C',
-                make_status: makeResponse.status,
-                make_body: rawBody?.slice(0, 1200) || '',
-            });
+        const certResult = await db.query(
+            'SELECT id FROM afip_credentials WHERE company_id = $1 LIMIT 1',
+            [company.id]
+        );
+        if (certResult.rows.length === 0) {
+            return res.status(400).json({ error: 'Faltan certificados AFIP para emitir comprobante' });
         }
 
+        const mappingResult = await db.query(
+            `SELECT mapping_json
+             FROM visual_mappings
+             WHERE company_id = $1
+               AND board_id = $2
+             ORDER BY updated_at DESC
+             LIMIT 1`,
+            [company.id, boardId]
+        );
+
+        if (mappingResult.rows.length === 0 || !mappingResult.rows[0].mapping_json) {
+            return res.status(400).json({ error: 'Falta mapeo visual guardado para este tablero' });
+        }
+
+        const mapping = mappingResult.rows[0].mapping_json;
+
+        const mondayData = await mondayApiRequest(
+            `query GetItemForInvoice($boardId: [ID!], $itemId: [ID!]) {
+                boards(ids: $boardId) {
+                    items_page(limit: 1, query_params: { ids: $itemId }) {
+                        items {
+                            id
+                            name
+                            column_values {
+                                id
+                                text
+                                value
+                            }
+                            subitems {
+                                id
+                                name
+                                column_values {
+                                    id
+                                    text
+                                    value
+                                }
+                            }
+                        }
+                    }
+                }
+            }`,
+            {
+                boardId: [Number(boardId)],
+                itemId: [Number(itemId)],
+            }
+        );
+
+        const item = mondayData?.boards?.[0]?.items_page?.items?.[0];
+        if (!item) {
+            return res.status(404).json({ error: 'No se encontró el item en monday' });
+        }
+
+        const mainColumns = item.column_values || [];
+        const subitems = item.subitems || [];
+
+        const fechaEmisionRaw = getColumnTextById(mainColumns, mapping.fecha_emision);
+        const receptorCuit = getColumnTextById(mainColumns, mapping.receptor_cuit) || null;
+
+        const rawLines = subitems.map((subitem) => ({
+            subitem_id: Number(subitem.id),
+            concept: getColumnTextById(subitem.column_values, mapping.concepto) || subitem.name || '',
+            quantity: getColumnTextById(subitem.column_values, mapping.cantidad),
+            unit_price: getColumnTextById(subitem.column_values, mapping.precio_unitario),
+        }));
+
+        const validLines = rawLines.filter((line) => (
+            line.concept &&
+            toNumberOrNull(line.quantity) !== null &&
+            toNumberOrNull(line.unit_price) !== null
+        ));
+
+        if (validLines.length === 0) {
+            return res.status(400).json({ error: 'No hay subitems válidos para emitir Factura C' });
+        }
+
+        const totalAmount = sumLineTotals(validLines);
+
+        const facturaCDraft = {
+            tipo_comprobante: 'C',
+            cuit_emisor: company.cuit,
+            punto_venta: company.default_point_of_sale,
+            fecha_emision: fechaEmisionRaw || new Date().toISOString().slice(0, 10),
+            receptor_cuit_o_dni: receptorCuit,
+            importe_total: Number(totalAmount.toFixed(2)),
+            lineas: validLines.map((line) => {
+                const quantity = toNumberOrNull(line.quantity) || 0;
+                const unitPrice = toNumberOrNull(line.unit_price) || 0;
+                return {
+                    descripcion: line.concept,
+                    cantidad: Number(quantity.toFixed(2)),
+                    precio_unitario: Number(unitPrice.toFixed(2)),
+                    subtotal: Number((quantity * unitPrice).toFixed(2)),
+                };
+            }),
+        };
+
         return res.status(202).json({
-            message: 'Disparo Factura C enviado a Make',
+            message: 'Factura C preparada en backend (siguiente paso: autorización AFIP WSFE)',
             item_id: Number(itemId),
             board_id: Number(boardId),
-            make_status: makeResponse.status,
-            make_body: rawBody?.slice(0, 1200) || '',
+            draft: facturaCDraft,
+            status_flow: COMPROBANTE_STATUS_FLOW,
         });
     } catch (err) {
-        console.error('❌ Error al disparar Factura C en Make:', err);
+        console.error('❌ Error al preparar Factura C en backend:', err);
         return res.status(500).json({
-            error: 'Error al disparar Factura C',
+            error: 'Error al preparar Factura C',
             details: err.message,
         });
     }
