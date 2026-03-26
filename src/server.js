@@ -22,6 +22,17 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
+async function getCompanyByMondayAccountId(mondayAccountId) {
+    const companyQuery = `
+        SELECT id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date
+        FROM companies
+        WHERE monday_account_id = $1
+        LIMIT 1;
+    `;
+    const companyResult = await db.query(companyQuery, [mondayAccountId]);
+    return companyResult.rows[0] || null;
+}
+
 // --- RUTAS ---
 
 app.get('/api/health', async (req, res) => {
@@ -45,20 +56,15 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
     });
 
     try {
-        const companyQuery = `
-            SELECT id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date
-            FROM companies
-            WHERE monday_account_id = $1
-            LIMIT 1;
-        `;
-        const companyResult = await db.query(companyQuery, [mondayAccountId]);
+        const company = await getCompanyByMondayAccountId(mondayAccountId);
 
-        if (companyResult.rows.length === 0) {
+        if (!company) {
             return res.json({
                 hasFiscalData: false,
                 hasCertificates: false,
                 fiscalData: null,
                 certificates: null,
+                visualMapping: null,
                 identifiers: {
                     monday_account_id: mondayAccountId,
                     board_id: board_id || null,
@@ -68,11 +74,32 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
             });
         }
 
-        const company = companyResult.rows[0];
         const certResult = await db.query(
             'SELECT expiration_date FROM afip_credentials WHERE company_id = $1 LIMIT 1',
             [company.id]
         );
+
+        let visualMapping = null;
+        if (board_id) {
+            const mappingResult = await db.query(
+                `SELECT mapping_json, is_locked, updated_at
+                 FROM visual_mappings
+                 WHERE company_id = $1
+                   AND board_id = $2
+                   AND COALESCE(view_id, '') = COALESCE($3, '')
+                   AND COALESCE(app_feature_id, '') = COALESCE($4, '')
+                 LIMIT 1`,
+                [company.id, String(board_id), view_id || null, app_feature_id || null]
+            );
+
+            if (mappingResult.rows.length > 0) {
+                visualMapping = {
+                    mapping: mappingResult.rows[0].mapping_json || {},
+                    is_locked: mappingResult.rows[0].is_locked,
+                    updated_at: mappingResult.rows[0].updated_at || null
+                };
+            }
+        }
 
         res.json({
             hasFiscalData: true,
@@ -86,6 +113,7 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
                 fecha_inicio: company.start_date || ''
             },
             certificates: certResult.rows[0] || null,
+            visualMapping,
             identifiers: {
                 monday_account_id: mondayAccountId,
                 board_id: board_id || null,
@@ -96,6 +124,131 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
     } catch (err) {
         console.error('❌ Error al consultar setup inicial:', err);
         res.status(500).json({ error: 'Error al consultar datos guardados' });
+    }
+});
+
+app.get('/api/mappings/:mondayAccountId', async (req, res) => {
+    const { mondayAccountId } = req.params;
+    const { board_id, view_id, app_feature_id } = req.query;
+
+    if (!board_id) {
+        return res.status(400).json({ error: 'board_id es obligatorio' });
+    }
+
+    try {
+        const company = await getCompanyByMondayAccountId(mondayAccountId);
+        if (!company) {
+            return res.json({ hasMapping: false, mapping: null });
+        }
+
+        const mappingResult = await db.query(
+            `SELECT id, mapping_json, is_locked, created_at, updated_at
+             FROM visual_mappings
+             WHERE company_id = $1
+               AND board_id = $2
+               AND COALESCE(view_id, '') = COALESCE($3, '')
+               AND COALESCE(app_feature_id, '') = COALESCE($4, '')
+             LIMIT 1`,
+            [company.id, String(board_id), view_id || null, app_feature_id || null]
+        );
+
+        if (mappingResult.rows.length === 0) {
+            return res.json({ hasMapping: false, mapping: null });
+        }
+
+        return res.json({
+            hasMapping: true,
+            mapping: {
+                id: mappingResult.rows[0].id,
+                mapping: mappingResult.rows[0].mapping_json || {},
+                is_locked: mappingResult.rows[0].is_locked,
+                created_at: mappingResult.rows[0].created_at,
+                updated_at: mappingResult.rows[0].updated_at
+            }
+        });
+    } catch (err) {
+        console.error('❌ Error al consultar mapeo visual:', err);
+        return res.status(500).json({ error: 'Error al consultar mapeo visual' });
+    }
+});
+
+app.post('/api/mappings', async (req, res) => {
+    const {
+        monday_account_id,
+        board_id,
+        view_id,
+        app_feature_id,
+        mapping,
+        is_locked
+    } = req.body;
+
+    if (!monday_account_id || !board_id) {
+        return res.status(400).json({ error: 'monday_account_id y board_id son obligatorios' });
+    }
+
+    if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
+        return res.status(400).json({ error: 'mapping debe ser un objeto JSON valido' });
+    }
+
+    try {
+        const company = await getCompanyByMondayAccountId(String(monday_account_id));
+        if (!company) {
+            return res.status(404).json({ error: 'Empresa no encontrada' });
+        }
+
+        const updateResult = await db.query(
+            `UPDATE visual_mappings
+             SET mapping_json = $5,
+                 is_locked = COALESCE($6, is_locked),
+                 updated_at = CURRENT_TIMESTAMP,
+                 version = version + 1
+             WHERE company_id = $1
+               AND board_id = $2
+               AND COALESCE(view_id, '') = COALESCE($3, '')
+               AND COALESCE(app_feature_id, '') = COALESCE($4, '')
+             RETURNING *`,
+            [
+                company.id,
+                String(board_id),
+                view_id || null,
+                app_feature_id || null,
+                JSON.stringify(mapping),
+                typeof is_locked === 'boolean' ? is_locked : null
+            ]
+        );
+
+        if (updateResult.rows.length > 0) {
+            return res.json({ message: 'Mapeo visual actualizado', mapping: updateResult.rows[0] });
+        }
+
+        const insertResult = await db.query(
+            `INSERT INTO visual_mappings (
+                company_id,
+                board_id,
+                view_id,
+                app_feature_id,
+                mapping_json,
+                is_locked
+            ) VALUES ($1, $2, $3, $4, $5, COALESCE($6, TRUE))
+            RETURNING *`,
+            [
+                company.id,
+                String(board_id),
+                view_id || null,
+                app_feature_id || null,
+                JSON.stringify(mapping),
+                typeof is_locked === 'boolean' ? is_locked : null
+            ]
+        );
+
+        return res.status(201).json({ message: 'Mapeo visual creado', mapping: insertResult.rows[0] });
+    } catch (err) {
+        console.error('❌ Error al guardar mapeo visual:', err);
+        return res.status(500).json({
+            error: 'Error al guardar mapeo visual',
+            details: err.message,
+            code: err.code
+        });
     }
 });
 
