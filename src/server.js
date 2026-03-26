@@ -343,6 +343,121 @@ async function ensureInvoiceEmissionsTable() {
     );
 }
 
+async function ensureUserApiTokensTable() {
+    await db.query(
+        `CREATE TABLE IF NOT EXISTS user_api_tokens (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL,
+            monday_user_id TEXT NOT NULL,
+            encrypted_api_token TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (company_id, monday_user_id)
+        )`
+    );
+}
+
+async function getStoredMondayUserApiToken({ companyId, mondayUserId }) {
+    if (!companyId) return null;
+
+    await ensureUserApiTokensTable();
+
+    const effectiveUserId = String(mondayUserId || 'account_default');
+    const result = await db.query(
+        `SELECT encrypted_api_token
+         FROM user_api_tokens
+         WHERE company_id = $1
+           AND monday_user_id = $2
+         LIMIT 1`,
+        [companyId, effectiveUserId]
+    );
+
+    if (result.rows.length === 0) return null;
+
+    const decrypted = CryptoJS.AES.decrypt(
+        result.rows[0].encrypted_api_token,
+        process.env.ENCRYPTION_KEY
+    ).toString(CryptoJS.enc.Utf8);
+
+    return decrypted || null;
+}
+
+async function getInvoicePdfColumnId({ companyId, boardId }) {
+    if (!companyId || !boardId) return null;
+
+    const configResult = await db.query(
+        `SELECT required_columns_json
+         FROM board_automation_configs
+         WHERE company_id = $1
+           AND board_id = $2
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [companyId, String(boardId)]
+    );
+
+    const requiredColumns = configResult.rows[0]?.required_columns_json;
+    if (!Array.isArray(requiredColumns)) return null;
+
+    const invoicePdfColumn = requiredColumns.find((column) => column?.key === 'invoice_pdf');
+    const resolvedColumnId = invoicePdfColumn?.resolved_column_id;
+
+    return resolvedColumnId ? String(resolvedColumnId) : null;
+}
+
+async function uploadPdfToMondayFileColumn({ apiToken, itemId, fileColumnId, pdfBuffer, filename }) {
+    if (!apiToken || !itemId || !fileColumnId || !pdfBuffer) {
+        return { uploaded: false, reason: 'missing_upload_inputs' };
+    }
+
+    const operations = {
+        query: `mutation ($itemId: ID!, $columnId: String!, $file: File!) {
+          add_file_to_column(item_id: $itemId, column_id: $columnId, file: $file) { id }
+        }`,
+        variables: {
+            itemId: Number(itemId),
+            columnId: String(fileColumnId),
+            file: null,
+        },
+    };
+
+    const map = { 0: ['variables.file'] };
+    const formData = new FormData();
+    formData.append('operations', JSON.stringify(operations));
+    formData.append('map', JSON.stringify(map));
+    formData.append('0', new Blob([pdfBuffer], { type: 'application/pdf' }), filename || 'comprobante.pdf');
+
+    const response = await fetch('https://api.monday.com/v2/file', {
+        method: 'POST',
+        headers: {
+            Authorization: String(apiToken).trim(),
+        },
+        body: formData,
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+    let payload = null;
+    if (contentType.includes('application/json')) {
+        payload = await response.json();
+    } else {
+        payload = { raw: await response.text() };
+    }
+
+    if (!response.ok) {
+        const details = typeof payload === 'string' ? payload : JSON.stringify(payload || {});
+        throw new Error(`Monday file upload HTTP ${response.status}: ${details.slice(0, 400)}`);
+    }
+
+    if (payload?.errors?.length) {
+        throw new Error(`Monday file upload error: ${JSON.stringify(payload.errors).slice(0, 400)}`);
+    }
+
+    const uploadedAssetId = payload?.data?.add_file_to_column?.id || null;
+    return {
+        uploaded: Boolean(uploadedAssetId),
+        asset_id: uploadedAssetId,
+    };
+}
+
 function generateFacturaCPdfBuffer({ company, draft, afipResult, itemId }) {
     return new Promise((resolve, reject) => {
         try {
@@ -672,6 +787,82 @@ app.post('/api/board-config', requireMondaySession, async (req, res) => {
             error: 'Error al guardar configuración de tablero',
             details: err.message,
             code: err.code
+        });
+    }
+});
+
+app.get('/api/user-api-token/:mondayAccountId', requireMondaySession, async (req, res) => {
+    const { mondayAccountId } = req.params;
+    if (!ensureAccountMatch(req, res, mondayAccountId)) return;
+
+    try {
+        const company = await getCompanyByMondayAccountId(mondayAccountId);
+        if (!company) {
+            return res.json({ has_token: false });
+        }
+
+        await ensureUserApiTokensTable();
+        const effectiveUserId = String(req.mondayIdentity?.userId || 'account_default');
+        const tokenResult = await db.query(
+            `SELECT id
+             FROM user_api_tokens
+             WHERE company_id = $1
+               AND monday_user_id = $2
+             LIMIT 1`,
+            [company.id, effectiveUserId]
+        );
+
+        return res.json({ has_token: tokenResult.rows.length > 0 });
+    } catch (err) {
+        console.error('❌ Error al consultar token de usuario monday:', err);
+        return res.status(500).json({ error: 'Error al consultar token de usuario' });
+    }
+});
+
+app.post('/api/user-api-token', requireMondaySession, async (req, res) => {
+    const { monday_account_id, api_token } = req.body;
+    const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+
+    if (!accountId) {
+        return res.status(400).json({ error: 'monday_account_id es obligatorio' });
+    }
+
+    if (!ensureAccountMatch(req, res, accountId)) return;
+
+    if (!api_token || !String(api_token).trim()) {
+        return res.status(400).json({ error: 'api_token es obligatorio' });
+    }
+
+    if (!process.env.ENCRYPTION_KEY) {
+        return res.status(500).json({ error: 'Falta ENCRYPTION_KEY en backend' });
+    }
+
+    try {
+        const company = await getCompanyByMondayAccountId(accountId);
+        if (!company) {
+            return res.status(404).json({ error: 'Empresa no encontrada' });
+        }
+
+        await ensureUserApiTokensTable();
+        const effectiveUserId = String(req.mondayIdentity?.userId || 'account_default');
+        const encryptedToken = CryptoJS.AES.encrypt(String(api_token).trim(), process.env.ENCRYPTION_KEY).toString();
+
+        await db.query(
+            `INSERT INTO user_api_tokens (company_id, monday_user_id, encrypted_api_token)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (company_id, monday_user_id)
+             DO UPDATE SET
+               encrypted_api_token = EXCLUDED.encrypted_api_token,
+               updated_at = CURRENT_TIMESTAMP`,
+            [company.id, effectiveUserId, encryptedToken]
+        );
+
+        return res.json({ message: 'Token de usuario guardado correctamente' });
+    } catch (err) {
+        console.error('❌ Error al guardar token de usuario monday:', err);
+        return res.status(500).json({
+            error: 'Error al guardar token de usuario',
+            details: err.message,
         });
     }
 });
@@ -1037,6 +1228,8 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
 
         let afipResult = null;
         let pdfBase64 = null;
+        let pdfBuffer = null;
+        let mondayUpload = null;
         const shouldIssueInAfip = issue_in_afip !== false;
         if (shouldIssueInAfip) {
             const certRow = certResult.rows[0];
@@ -1061,13 +1254,47 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
             });
 
             if (afipResult?.cae) {
-                const pdfBuffer = await generateFacturaCPdfBuffer({
+                pdfBuffer = await generateFacturaCPdfBuffer({
                     company,
                     draft: facturaCDraft,
                     afipResult,
                     itemId,
                 });
                 pdfBase64 = pdfBuffer.toString('base64');
+            }
+        }
+
+        if (pdfBuffer) {
+            const mondayUserToken = await getStoredMondayUserApiToken({
+                companyId: company.id,
+                mondayUserId: req.mondayIdentity?.userId,
+            });
+            const invoicePdfColumnId = await getInvoicePdfColumnId({
+                companyId: company.id,
+                boardId,
+            });
+
+            if (mondayUserToken && invoicePdfColumnId) {
+                try {
+                    mondayUpload = await uploadPdfToMondayFileColumn({
+                        apiToken: mondayUserToken,
+                        itemId,
+                        fileColumnId: invoicePdfColumnId,
+                        pdfBuffer,
+                        filename: `Factura-C-${itemId}.pdf`,
+                    });
+                } catch (uploadErr) {
+                    mondayUpload = {
+                        uploaded: false,
+                        reason: 'upload_failed',
+                        details: uploadErr.message,
+                    };
+                }
+            } else {
+                mondayUpload = {
+                    uploaded: false,
+                    reason: !mondayUserToken ? 'missing_user_api_token' : 'missing_invoice_pdf_column',
+                };
             }
         }
 
@@ -1101,6 +1328,7 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
             status_flow: COMPROBANTE_STATUS_FLOW,
             afip_result: afipResult,
             pdf_base64: pdfBase64,
+            monday_upload: mondayUpload,
         });
     } catch (err) {
         console.error('❌ Error al preparar Factura C en backend:', err);
