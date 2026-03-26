@@ -33,6 +33,10 @@ async function getCompanyByMondayAccountId(mondayAccountId) {
     return companyResult.rows[0] || null;
 }
 
+function isMissingTableError(err) {
+    return err?.code === '42P01';
+}
+
 // --- RUTAS ---
 
 app.get('/api/health', async (req, res) => {
@@ -65,6 +69,7 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
                 fiscalData: null,
                 certificates: null,
                 visualMapping: null,
+                boardConfig: null,
                 identifiers: {
                     monday_account_id: mondayAccountId,
                     board_id: board_id || null,
@@ -101,6 +106,38 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
             }
         }
 
+        let boardConfig = null;
+        if (board_id) {
+            try {
+                const boardConfigResult = await db.query(
+                    `SELECT status_column_id, trigger_label, success_label, error_label, required_columns_json, updated_at
+                     FROM board_automation_configs
+                     WHERE company_id = $1
+                       AND board_id = $2
+                       AND COALESCE(view_id, '') = COALESCE($3, '')
+                       AND COALESCE(app_feature_id, '') = COALESCE($4, '')
+                     LIMIT 1`,
+                    [company.id, String(board_id), view_id || null, app_feature_id || null]
+                );
+
+                if (boardConfigResult.rows.length > 0) {
+                    const row = boardConfigResult.rows[0];
+                    boardConfig = {
+                        status_column_id: row.status_column_id || '',
+                        trigger_label: row.trigger_label || 'Crear Factura',
+                        success_label: row.success_label || 'Emitida',
+                        error_label: row.error_label || 'Error',
+                        required_columns: row.required_columns_json || [],
+                        updated_at: row.updated_at || null
+                    };
+                }
+            } catch (boardConfigErr) {
+                if (!isMissingTableError(boardConfigErr)) {
+                    throw boardConfigErr;
+                }
+            }
+        }
+
         res.json({
             hasFiscalData: true,
             hasCertificates: certResult.rows.length > 0,
@@ -114,6 +151,7 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
             },
             certificates: certResult.rows[0] || null,
             visualMapping,
+            boardConfig,
             identifiers: {
                 monday_account_id: mondayAccountId,
                 board_id: board_id || null,
@@ -124,6 +162,160 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
     } catch (err) {
         console.error('❌ Error al consultar setup inicial:', err);
         res.status(500).json({ error: 'Error al consultar datos guardados' });
+    }
+});
+
+app.get('/api/board-config/:mondayAccountId', async (req, res) => {
+    const { mondayAccountId } = req.params;
+    const { board_id, view_id, app_feature_id } = req.query;
+
+    if (!board_id) {
+        return res.status(400).json({ error: 'board_id es obligatorio' });
+    }
+
+    try {
+        const company = await getCompanyByMondayAccountId(mondayAccountId);
+        if (!company) {
+            return res.json({ hasConfig: false, config: null });
+        }
+
+        const result = await db.query(
+            `SELECT id, status_column_id, trigger_label, success_label, error_label, required_columns_json, updated_at
+             FROM board_automation_configs
+             WHERE company_id = $1
+               AND board_id = $2
+               AND COALESCE(view_id, '') = COALESCE($3, '')
+               AND COALESCE(app_feature_id, '') = COALESCE($4, '')
+             LIMIT 1`,
+            [company.id, String(board_id), view_id || null, app_feature_id || null]
+        );
+
+        if (result.rows.length === 0) {
+            return res.json({ hasConfig: false, config: null });
+        }
+
+        const row = result.rows[0];
+        return res.json({
+            hasConfig: true,
+            config: {
+                id: row.id,
+                status_column_id: row.status_column_id || '',
+                trigger_label: row.trigger_label || 'Crear Factura',
+                success_label: row.success_label || 'Emitida',
+                error_label: row.error_label || 'Error',
+                required_columns: row.required_columns_json || [],
+                updated_at: row.updated_at || null
+            }
+        });
+    } catch (err) {
+        if (isMissingTableError(err)) {
+            return res.status(503).json({
+                error: 'Falta crear la tabla board_automation_configs en la base de datos'
+            });
+        }
+
+        console.error('❌ Error al consultar configuración de tablero:', err);
+        return res.status(500).json({ error: 'Error al consultar configuración de tablero' });
+    }
+});
+
+app.post('/api/board-config', async (req, res) => {
+    const {
+        monday_account_id,
+        board_id,
+        view_id,
+        app_feature_id,
+        status_column_id,
+        trigger_label,
+        success_label,
+        error_label,
+        required_columns
+    } = req.body;
+
+    if (!monday_account_id || !board_id || !status_column_id) {
+        return res.status(400).json({ error: 'monday_account_id, board_id y status_column_id son obligatorios' });
+    }
+
+    if (!Array.isArray(required_columns)) {
+        return res.status(400).json({ error: 'required_columns debe ser un array' });
+    }
+
+    try {
+        const company = await getCompanyByMondayAccountId(String(monday_account_id));
+        if (!company) {
+            return res.status(404).json({ error: 'Empresa no encontrada' });
+        }
+
+        const updateResult = await db.query(
+            `UPDATE board_automation_configs
+             SET status_column_id = $5,
+                 trigger_label = $6,
+                 success_label = $7,
+                 error_label = $8,
+                 required_columns_json = $9,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE company_id = $1
+               AND board_id = $2
+               AND COALESCE(view_id, '') = COALESCE($3, '')
+               AND COALESCE(app_feature_id, '') = COALESCE($4, '')
+             RETURNING *`,
+            [
+                company.id,
+                String(board_id),
+                view_id || null,
+                app_feature_id || null,
+                String(status_column_id),
+                (trigger_label || 'Crear Factura').trim(),
+                (success_label || 'Emitida').trim(),
+                (error_label || 'Error').trim(),
+                JSON.stringify(required_columns)
+            ]
+        );
+
+        if (updateResult.rows.length > 0) {
+            return res.json({ message: 'Configuración de tablero actualizada', config: updateResult.rows[0] });
+        }
+
+        const insertResult = await db.query(
+            `INSERT INTO board_automation_configs (
+                company_id,
+                board_id,
+                view_id,
+                app_feature_id,
+                status_column_id,
+                trigger_label,
+                success_label,
+                error_label,
+                required_columns_json
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *`,
+            [
+                company.id,
+                String(board_id),
+                view_id || null,
+                app_feature_id || null,
+                String(status_column_id),
+                (trigger_label || 'Crear Factura').trim(),
+                (success_label || 'Emitida').trim(),
+                (error_label || 'Error').trim(),
+                JSON.stringify(required_columns)
+            ]
+        );
+
+        return res.status(201).json({ message: 'Configuración de tablero creada', config: insertResult.rows[0] });
+    } catch (err) {
+        if (isMissingTableError(err)) {
+            return res.status(503).json({
+                error: 'Falta crear la tabla board_automation_configs en la base de datos'
+            });
+        }
+
+        console.error('❌ Error al guardar configuración de tablero:', err);
+        return res.status(500).json({
+            error: 'Error al guardar configuración de tablero',
+            details: err.message,
+            code: err.code
+        });
     }
 });
 
