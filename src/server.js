@@ -798,7 +798,7 @@ app.post('/api/board-config', requireMondaySession, async (req, res) => {
     }
 });
 
-app.get('/api/user-api-token/:mondayAccountId', requireMondaySession, async (req, res) => {
+const getUserApiTokenHandler = async (req, res) => {
     const { mondayAccountId } = req.params;
     if (!ensureAccountMatch(req, res, mondayAccountId)) return;
 
@@ -824,9 +824,12 @@ app.get('/api/user-api-token/:mondayAccountId', requireMondaySession, async (req
         console.error('❌ Error al consultar token de usuario monday:', err);
         return res.status(500).json({ error: 'Error al consultar token de usuario' });
     }
-});
+};
 
-app.post('/api/user-api-token', requireMondaySession, async (req, res) => {
+app.get('/api/user-api-token/:mondayAccountId', requireMondaySession, getUserApiTokenHandler);
+app.get('/api/user-api-token-v2/:mondayAccountId', requireMondaySession, getUserApiTokenHandler);
+
+const saveUserApiTokenHandler = async (req, res) => {
     const { monday_account_id, api_token } = req.body;
     const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
 
@@ -873,7 +876,10 @@ app.post('/api/user-api-token', requireMondaySession, async (req, res) => {
             code: err.code,
         });
     }
-});
+};
+
+app.post('/api/user-api-token', requireMondaySession, saveUserApiTokenHandler);
+app.post('/api/user-api-token-v2', requireMondaySession, saveUserApiTokenHandler);
 
 app.get('/api/mappings/:mondayAccountId', requireMondaySession, async (req, res) => {
     const { mondayAccountId } = req.params;
