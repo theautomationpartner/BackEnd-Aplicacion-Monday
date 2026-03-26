@@ -119,6 +119,7 @@ async function getUserTokenSchemaDiagnostics() {
         db_user: null,
         companies_monday_account_id_type: null,
         user_api_tokens_monday_user_id_type: null,
+        user_api_tokens_v2_encrypted_api_token_type: null,
     };
 
     try {
@@ -131,8 +132,8 @@ async function getUserTokenSchemaDiagnostics() {
         const columnTypesResult = await db.query(
             `SELECT table_name, column_name, data_type
              FROM information_schema.columns
-             WHERE table_name IN ('companies', 'user_api_tokens')
-               AND column_name IN ('monday_account_id', 'monday_user_id')`
+                         WHERE table_name IN ('companies', 'user_api_tokens', 'user_api_tokens_v2')
+                             AND column_name IN ('monday_account_id', 'monday_user_id', 'encrypted_api_token')`
         );
 
         for (const row of columnTypesResult.rows) {
@@ -141,6 +142,9 @@ async function getUserTokenSchemaDiagnostics() {
             }
             if (row.table_name === 'user_api_tokens' && row.column_name === 'monday_user_id') {
                 diagnostics.user_api_tokens_monday_user_id_type = row.data_type;
+            }
+            if (row.table_name === 'user_api_tokens_v2' && row.column_name === 'encrypted_api_token') {
+                diagnostics.user_api_tokens_v2_encrypted_api_token_type = row.data_type;
             }
         }
     } catch (diagErr) {
@@ -406,9 +410,40 @@ async function ensureUserApiTokensTable() {
     );
 }
 
+async function ensureUserApiTokensV2Table() {
+    await db.query(
+        `CREATE TABLE IF NOT EXISTS user_api_tokens_v2 (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL UNIQUE,
+            encrypted_api_token TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`
+    );
+}
+
 async function getStoredMondayUserApiToken({ companyId, mondayUserId }) {
     if (!companyId) return null;
 
+    await ensureUserApiTokensV2Table();
+
+    const v2Result = await db.query(
+        `SELECT encrypted_api_token
+         FROM user_api_tokens_v2
+         WHERE company_id = $1
+         LIMIT 1`,
+        [companyId]
+    );
+
+    if (v2Result.rows.length > 0) {
+        const decryptedV2 = CryptoJS.AES.decrypt(
+            v2Result.rows[0].encrypted_api_token,
+            process.env.ENCRYPTION_KEY
+        ).toString(CryptoJS.enc.Utf8);
+        if (decryptedV2) return decryptedV2;
+    }
+
+    // Fallback legacy table.
     await ensureUserApiTokensTable();
 
     const effectiveUserId = '0';
@@ -850,15 +885,13 @@ const getUserApiTokenHandler = async (req, res) => {
             return res.json({ has_token: false });
         }
 
-        await ensureUserApiTokensTable();
-        const effectiveUserId = '0';
+        await ensureUserApiTokensV2Table();
         const tokenResult = await db.query(
             `SELECT id
-             FROM user_api_tokens
+             FROM user_api_tokens_v2
              WHERE company_id = $1
-                             AND monday_user_id::text = $2
              LIMIT 1`,
-            [company.id, effectiveUserId]
+            [company.id]
         );
 
         return res.json({ has_token: tokenResult.rows.length > 0 });
@@ -903,24 +936,23 @@ const saveUserApiTokenHandler = async (req, res) => {
             return res.status(404).json({ error: 'Empresa no encontrada' });
         }
 
-        await ensureUserApiTokensTable();
-        const effectiveUserId = '0';
+        await ensureUserApiTokensV2Table();
         const encryptedToken = CryptoJS.AES.encrypt(String(api_token).trim(), process.env.ENCRYPTION_KEY).toString();
 
         await db.query(
-            `INSERT INTO user_api_tokens (company_id, monday_user_id, encrypted_api_token)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (company_id, monday_user_id)
+            `INSERT INTO user_api_tokens_v2 (company_id, encrypted_api_token)
+             VALUES ($1, $2)
+             ON CONFLICT (company_id)
              DO UPDATE SET
                encrypted_api_token = EXCLUDED.encrypted_api_token,
                updated_at = CURRENT_TIMESTAMP`,
-            [company.id, effectiveUserId, encryptedToken]
+            [company.id, encryptedToken]
         );
 
         console.log('✅ saveUserApiToken success', {
             debug_id: debugId,
             company_id: company.id,
-            effective_user_id: effectiveUserId,
+            storage: 'user_api_tokens_v2',
         });
 
         return res.json({
