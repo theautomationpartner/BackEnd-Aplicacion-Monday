@@ -107,6 +107,16 @@ function ensureAccountMatch(req, res, providedAccountId) {
     return true;
 }
 
+function isValidHttpsUrl(value) {
+    if (!value || typeof value !== 'string') return false;
+    try {
+        const parsed = new URL(value);
+        return parsed.protocol === 'https:';
+    } catch (err) {
+        return false;
+    }
+}
+
 // --- RUTAS ---
 
 app.get('/api/health', async (req, res) => {
@@ -620,6 +630,85 @@ app.post('/api/certificates', requireMondaySession, upload.fields([
             error: 'Error al procesar certificados',
             details: err.message,
             code: err.code
+        });
+    }
+});
+
+app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
+    const {
+        monday_account_id,
+        board_id,
+        item_id,
+        webhook_url
+    } = req.body;
+
+    const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+    const boardId = String(board_id || '').trim();
+    const itemId = String(item_id || '').trim();
+
+    if (!accountId || !boardId || !itemId) {
+        return res.status(400).json({ error: 'monday_account_id, board_id e item_id son obligatorios' });
+    }
+
+    if (!ensureAccountMatch(req, res, accountId)) return;
+
+    const configuredWebhookUrl = String(webhook_url || process.env.MAKE_WEBHOOK_FACTURA_C_URL || '').trim();
+    if (!isValidHttpsUrl(configuredWebhookUrl)) {
+        return res.status(400).json({
+            error: 'Falta webhook válido de Make para Factura C. Enviá webhook_url o configurá MAKE_WEBHOOK_FACTURA_C_URL'
+        });
+    }
+
+    try {
+        const company = await getCompanyByMondayAccountId(accountId);
+        if (!company) {
+            return res.status(404).json({ error: 'Empresa no encontrada para la cuenta monday' });
+        }
+
+        const payload = {
+            event: {
+                pulseId: Number(itemId),
+                boardId: Number(boardId),
+                accountId: Number(accountId),
+                userId: req.mondayIdentity?.userId ? Number(req.mondayIdentity.userId) : null,
+                triggerTime: new Date().toISOString(),
+            },
+            factura: {
+                tipo: 'C',
+                statusFlow: COMPROBANTE_STATUS_FLOW,
+            },
+            source: 'tap-monday-app',
+        };
+
+        const makeResponse = await fetch(configuredWebhookUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+        });
+
+        const rawBody = await makeResponse.text();
+        if (!makeResponse.ok) {
+            return res.status(502).json({
+                error: 'Make respondió con error al disparar Factura C',
+                make_status: makeResponse.status,
+                make_body: rawBody?.slice(0, 1200) || '',
+            });
+        }
+
+        return res.status(202).json({
+            message: 'Disparo Factura C enviado a Make',
+            item_id: Number(itemId),
+            board_id: Number(boardId),
+            make_status: makeResponse.status,
+            make_body: rawBody?.slice(0, 1200) || '',
+        });
+    } catch (err) {
+        console.error('❌ Error al disparar Factura C en Make:', err);
+        return res.status(500).json({
+            error: 'Error al disparar Factura C',
+            details: err.message,
         });
     }
 });
