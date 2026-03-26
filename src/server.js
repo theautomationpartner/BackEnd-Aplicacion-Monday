@@ -5,6 +5,7 @@ const multer = require('multer');
 const CryptoJS = require('crypto-js');
 const jwt = require('jsonwebtoken');
 const forge = require('node-forge');
+const PDFDocument = require('pdfkit');
 const serverless = require('serverless-http');
 const db = require('./db');
 require('dotenv').config();
@@ -319,6 +320,71 @@ function sumLineTotals(lines) {
         const unitPrice = toNumberOrNull(line.unit_price) || 0;
         return acc + (quantity * unitPrice);
     }, 0);
+}
+
+async function ensureInvoiceEmissionsTable() {
+    await db.query(
+        `CREATE TABLE IF NOT EXISTS invoice_emissions (
+            id SERIAL PRIMARY KEY,
+            company_id INTEGER NOT NULL,
+            board_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            invoice_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            request_json JSONB,
+            draft_json JSONB,
+            afip_result_json JSONB,
+            pdf_base64 TEXT,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (company_id, board_id, item_id, invoice_type)
+        )`
+    );
+}
+
+function generateFacturaCPdfBuffer({ company, draft, afipResult, itemId }) {
+    return new Promise((resolve, reject) => {
+        try {
+            const doc = new PDFDocument({ size: 'A4', margin: 40 });
+            const buffers = [];
+            doc.on('data', (chunk) => buffers.push(chunk));
+            doc.on('end', () => resolve(Buffer.concat(buffers)));
+            doc.on('error', reject);
+
+            doc.fontSize(18).text('Factura C', { align: 'center' });
+            doc.moveDown(0.5);
+            doc.fontSize(11).text(`Emisor: ${company.business_name || 'N/D'}`);
+            doc.text(`CUIT emisor: ${draft.cuit_emisor || 'N/D'}`);
+            doc.text(`Punto de venta: ${draft.punto_venta || 'N/D'}`);
+            doc.text(`Fecha emisión: ${draft.fecha_emision || 'N/D'}`);
+            doc.text(`Item Monday: ${itemId}`);
+            doc.moveDown(0.5);
+
+            if (afipResult?.cae) {
+                doc.text(`CAE: ${afipResult.cae}`);
+                doc.text(`Vto CAE: ${afipResult.cae_vencimiento || 'N/D'}`);
+                doc.text(`Comprobante nro: ${afipResult.numero_comprobante || 'N/D'}`);
+                doc.text(`Resultado AFIP: ${afipResult.resultado || 'N/D'}`);
+            }
+
+            doc.moveDown();
+            doc.fontSize(12).text('Detalle', { underline: true });
+            doc.moveDown(0.3);
+            doc.fontSize(10);
+
+            (draft.lineas || []).forEach((line, index) => {
+                doc.text(`${index + 1}. ${line.descripcion || 'Sin descripción'}`);
+                doc.text(`   Cantidad: ${line.cantidad} | Precio unitario: ${line.precio_unitario} | Subtotal: ${line.subtotal}`);
+            });
+
+            doc.moveDown();
+            doc.fontSize(12).text(`Importe total: ${draft.importe_total || 0}`);
+            doc.end();
+        } catch (err) {
+            reject(err);
+        }
+    });
 }
 
 // --- RUTAS ---
@@ -869,6 +935,38 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
             return res.status(404).json({ error: 'Empresa no encontrada para la cuenta monday' });
         }
 
+        await ensureInvoiceEmissionsTable();
+
+        const existingEmission = await db.query(
+            `SELECT id, status, afip_result_json, pdf_base64, updated_at
+             FROM invoice_emissions
+             WHERE company_id = $1
+               AND board_id = $2
+               AND item_id = $3
+               AND invoice_type = 'C'
+             LIMIT 1`,
+            [company.id, boardId, itemId]
+        );
+
+        if (existingEmission.rows.length > 0 && existingEmission.rows[0].status === 'success') {
+            return res.status(409).json({
+                error: 'Este item ya fue emitido como Factura C',
+                emission: existingEmission.rows[0],
+            });
+        }
+
+        await db.query(
+            `INSERT INTO invoice_emissions (company_id, board_id, item_id, invoice_type, status, request_json)
+             VALUES ($1, $2, $3, 'C', 'processing', $4)
+             ON CONFLICT (company_id, board_id, item_id, invoice_type)
+             DO UPDATE SET
+               status = 'processing',
+               request_json = EXCLUDED.request_json,
+               error_message = NULL,
+               updated_at = CURRENT_TIMESTAMP`,
+            [company.id, boardId, itemId, JSON.stringify(req.body || {})]
+        );
+
         const certResult = await db.query(
             'SELECT id, crt_file_url, encrypted_private_key FROM afip_credentials WHERE company_id = $1 LIMIT 1',
             [company.id]
@@ -938,6 +1036,7 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
         };
 
         let afipResult = null;
+        let pdfBase64 = null;
         const shouldIssueInAfip = issue_in_afip !== false;
         if (shouldIssueInAfip) {
             const certRow = certResult.rows[0];
@@ -960,7 +1059,39 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
                 pointOfSale: company.default_point_of_sale,
                 draft: facturaCDraft,
             });
+
+            if (afipResult?.cae) {
+                const pdfBuffer = await generateFacturaCPdfBuffer({
+                    company,
+                    draft: facturaCDraft,
+                    afipResult,
+                    itemId,
+                });
+                pdfBase64 = pdfBuffer.toString('base64');
+            }
         }
+
+        await db.query(
+            `UPDATE invoice_emissions
+             SET status = $5,
+                 draft_json = $6,
+                 afip_result_json = $7,
+                 pdf_base64 = $8,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE company_id = $1
+               AND board_id = $2
+               AND item_id = $3
+               AND invoice_type = 'C'`,
+            [
+                company.id,
+                boardId,
+                itemId,
+                afipResult?.cae ? 'success' : 'prepared',
+                JSON.stringify(facturaCDraft),
+                JSON.stringify(afipResult || null),
+                pdfBase64,
+            ]
+        );
 
         return res.status(202).json({
             message: afipResult ? 'Factura C emitida en AFIP desde backend' : 'Factura C preparada en backend',
@@ -969,9 +1100,30 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
             draft: facturaCDraft,
             status_flow: COMPROBANTE_STATUS_FLOW,
             afip_result: afipResult,
+            pdf_base64: pdfBase64,
         });
     } catch (err) {
         console.error('❌ Error al preparar Factura C en backend:', err);
+        try {
+            const company = await getCompanyByMondayAccountId(accountId);
+            if (company) {
+                await ensureInvoiceEmissionsTable();
+                await db.query(
+                    `UPDATE invoice_emissions
+                     SET status = 'error',
+                         error_message = $4,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE company_id = $1
+                       AND board_id = $2
+                       AND item_id = $3
+                       AND invoice_type = 'C'`,
+                    [company.id, boardId, itemId, err.message]
+                );
+            }
+        } catch (persistErr) {
+            console.error('❌ Error guardando estado de error en invoice_emissions:', persistErr);
+        }
+
         return res.status(500).json({
             error: 'Error al preparar Factura C',
             details: err.message,
