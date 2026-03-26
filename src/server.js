@@ -107,40 +107,6 @@ function ensureAccountMatch(req, res, providedAccountId) {
     return true;
 }
 
-function isValidHttpsUrl(value) {
-    if (!value || typeof value !== 'string') return false;
-    try {
-        const parsed = new URL(value);
-        return parsed.protocol === 'https:';
-    } catch (err) {
-        return false;
-    }
-}
-
-async function mondayApiRequest(query, variables = {}) {
-    const mondayApiToken = (process.env.MONDAY_API_TOKEN || '').trim();
-    if (!mondayApiToken) {
-        throw new Error('Falta MONDAY_API_TOKEN para consultar datos en monday');
-    }
-
-    const response = await fetch('https://api.monday.com/v2', {
-        method: 'POST',
-        headers: {
-            Authorization: mondayApiToken,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ query, variables }),
-    });
-
-    const data = await response.json();
-    if (!response.ok || data?.errors?.length) {
-        const details = data?.errors?.map((err) => err.message).join(' | ') || response.statusText;
-        throw new Error(`Error monday API: ${details}`);
-    }
-
-    return data?.data;
-}
-
 function toNumberOrNull(value) {
     if (value === null || value === undefined || value === '') return null;
     const normalized = String(value).trim().replace(',', '.');
@@ -683,7 +649,8 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
     const {
         monday_account_id,
         board_id,
-        item_id
+        item_id,
+        item_snapshot
     } = req.body;
 
     const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
@@ -692,6 +659,12 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
 
     if (!accountId || !boardId || !itemId) {
         return res.status(400).json({ error: 'monday_account_id, board_id e item_id son obligatorios' });
+    }
+
+    if (!item_snapshot || !Array.isArray(item_snapshot.main_columns) || !Array.isArray(item_snapshot.subitems)) {
+        return res.status(400).json({
+            error: 'Falta item_snapshot con columnas de item y subitems para procesar Factura C'
+        });
     }
 
     if (!ensureAccountMatch(req, res, accountId)) return;
@@ -726,50 +699,14 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
 
         const mapping = mappingResult.rows[0].mapping_json;
 
-        const mondayData = await mondayApiRequest(
-            `query GetItemForInvoice($boardId: [ID!], $itemId: [ID!]) {
-                boards(ids: $boardId) {
-                    items_page(limit: 1, query_params: { ids: $itemId }) {
-                        items {
-                            id
-                            name
-                            column_values {
-                                id
-                                text
-                                value
-                            }
-                            subitems {
-                                id
-                                name
-                                column_values {
-                                    id
-                                    text
-                                    value
-                                }
-                            }
-                        }
-                    }
-                }
-            }`,
-            {
-                boardId: [Number(boardId)],
-                itemId: [Number(itemId)],
-            }
-        );
-
-        const item = mondayData?.boards?.[0]?.items_page?.items?.[0];
-        if (!item) {
-            return res.status(404).json({ error: 'No se encontró el item en monday' });
-        }
-
-        const mainColumns = item.column_values || [];
-        const subitems = item.subitems || [];
+        const mainColumns = item_snapshot.main_columns || [];
+        const subitems = item_snapshot.subitems || [];
 
         const fechaEmisionRaw = getColumnTextById(mainColumns, mapping.fecha_emision);
         const receptorCuit = getColumnTextById(mainColumns, mapping.receptor_cuit) || null;
 
         const rawLines = subitems.map((subitem) => ({
-            subitem_id: Number(subitem.id),
+            subitem_id: Number(subitem.id || 0),
             concept: getColumnTextById(subitem.column_values, mapping.concepto) || subitem.name || '',
             quantity: getColumnTextById(subitem.column_values, mapping.cantidad),
             unit_price: getColumnTextById(subitem.column_values, mapping.precio_unitario),
