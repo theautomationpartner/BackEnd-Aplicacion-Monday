@@ -63,10 +63,9 @@ function parseAuthorizationToken(req) {
 function extractMondayIdentity(decodedToken) {
     const dat = decodedToken?.dat || decodedToken?.data || {};
     const accountId = dat.account_id || decodedToken?.account_id || decodedToken?.accountId || null;
-    const userId = dat.user_id || decodedToken?.user_id || decodedToken?.userId || null;
     return {
         accountId: accountId ? String(accountId) : null,
-        userId: userId ? String(userId) : null,
+        userId: null,
     };
 }
 
