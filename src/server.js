@@ -863,6 +863,7 @@ app.post('/api/user-api-token', requireMondaySession, async (req, res) => {
         return res.status(500).json({
             error: 'Error al guardar token de usuario',
             details: err.message,
+            code: err.code,
         });
     }
 });
