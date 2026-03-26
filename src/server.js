@@ -27,7 +27,7 @@ const upload = multer({ storage });
 
 async function getCompanyByMondayAccountId(mondayAccountId) {
     const companyQuery = `
-        SELECT id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date
+        SELECT id, monday_account_id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date
         FROM companies
         WHERE monday_account_id::text = $1
         LIMIT 1;
@@ -120,6 +120,7 @@ async function getUserTokenSchemaDiagnostics() {
         companies_monday_account_id_type: null,
         user_api_tokens_monday_user_id_type: null,
         user_api_tokens_v2_encrypted_api_token_type: null,
+        user_api_tokens_v3_monday_account_id_type: null,
     };
 
     try {
@@ -132,7 +133,7 @@ async function getUserTokenSchemaDiagnostics() {
         const columnTypesResult = await db.query(
             `SELECT table_name, column_name, data_type
              FROM information_schema.columns
-                         WHERE table_name IN ('companies', 'user_api_tokens', 'user_api_tokens_v2')
+                         WHERE table_name IN ('companies', 'user_api_tokens', 'user_api_tokens_v2', 'user_api_tokens_v3')
                              AND column_name IN ('monday_account_id', 'monday_user_id', 'encrypted_api_token')`
         );
 
@@ -145,6 +146,9 @@ async function getUserTokenSchemaDiagnostics() {
             }
             if (row.table_name === 'user_api_tokens_v2' && row.column_name === 'encrypted_api_token') {
                 diagnostics.user_api_tokens_v2_encrypted_api_token_type = row.data_type;
+            }
+            if (row.table_name === 'user_api_tokens_v3' && row.column_name === 'monday_account_id') {
+                diagnostics.user_api_tokens_v3_monday_account_id_type = row.data_type;
             }
         }
     } catch (diagErr) {
@@ -422,38 +426,29 @@ async function ensureUserApiTokensV2Table() {
     );
 }
 
-async function getStoredMondayUserApiToken({ companyId, mondayUserId }) {
-    if (!companyId) return null;
-
-    await ensureUserApiTokensV2Table();
-
-    const v2Result = await db.query(
-        `SELECT encrypted_api_token
-         FROM user_api_tokens_v2
-         WHERE company_id = $1
-         LIMIT 1`,
-        [companyId]
+async function ensureUserApiTokensV3Table() {
+    await db.query(
+        `CREATE TABLE IF NOT EXISTS user_api_tokens_v3 (
+            id SERIAL PRIMARY KEY,
+            monday_account_id TEXT NOT NULL UNIQUE,
+            encrypted_api_token TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`
     );
+}
 
-    if (v2Result.rows.length > 0) {
-        const decryptedV2 = CryptoJS.AES.decrypt(
-            v2Result.rows[0].encrypted_api_token,
-            process.env.ENCRYPTION_KEY
-        ).toString(CryptoJS.enc.Utf8);
-        if (decryptedV2) return decryptedV2;
-    }
+async function getStoredMondayUserApiToken({ mondayAccountId }) {
+    if (!mondayAccountId) return null;
 
-    // Fallback legacy table.
-    await ensureUserApiTokensTable();
+    await ensureUserApiTokensV3Table();
 
-    const effectiveUserId = '0';
     const result = await db.query(
         `SELECT encrypted_api_token
-         FROM user_api_tokens
-         WHERE company_id = $1
-                     AND monday_user_id::text = $2
+         FROM user_api_tokens_v3
+         WHERE monday_account_id = $1
          LIMIT 1`,
-        [companyId, effectiveUserId]
+        [String(mondayAccountId)]
     );
 
     if (result.rows.length === 0) return null;
@@ -885,13 +880,13 @@ const getUserApiTokenHandler = async (req, res) => {
             return res.json({ has_token: false });
         }
 
-        await ensureUserApiTokensV2Table();
+        await ensureUserApiTokensV3Table();
         const tokenResult = await db.query(
             `SELECT id
-             FROM user_api_tokens_v2
-             WHERE company_id = $1
+             FROM user_api_tokens_v3
+             WHERE monday_account_id = $1
              LIMIT 1`,
-            [company.id]
+            [String(accountId)]
         );
 
         return res.json({ has_token: tokenResult.rows.length > 0 });
@@ -936,23 +931,23 @@ const saveUserApiTokenHandler = async (req, res) => {
             return res.status(404).json({ error: 'Empresa no encontrada' });
         }
 
-        await ensureUserApiTokensV2Table();
+        await ensureUserApiTokensV3Table();
         const encryptedToken = CryptoJS.AES.encrypt(String(api_token).trim(), process.env.ENCRYPTION_KEY).toString();
 
         await db.query(
-            `INSERT INTO user_api_tokens_v2 (company_id, encrypted_api_token)
+            `INSERT INTO user_api_tokens_v3 (monday_account_id, encrypted_api_token)
              VALUES ($1, $2)
-             ON CONFLICT (company_id)
+             ON CONFLICT (monday_account_id)
              DO UPDATE SET
                encrypted_api_token = EXCLUDED.encrypted_api_token,
                updated_at = CURRENT_TIMESTAMP`,
-            [company.id, encryptedToken]
+            [String(accountId), encryptedToken]
         );
 
         console.log('✅ saveUserApiToken success', {
             debug_id: debugId,
             company_id: company.id,
-            storage: 'user_api_tokens_v2',
+            storage: 'user_api_tokens_v3',
         });
 
         return res.json({
@@ -1380,8 +1375,7 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
 
         if (pdfBuffer) {
             const mondayUserToken = await getStoredMondayUserApiToken({
-                companyId: company.id,
-                mondayUserId: null,
+                mondayAccountId: accountId,
             });
             const invoicePdfColumnId = await getInvoicePdfColumnId({
                 companyId: company.id,
