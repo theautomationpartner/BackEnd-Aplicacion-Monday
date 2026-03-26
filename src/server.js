@@ -355,6 +355,14 @@ async function ensureUserApiTokensTable() {
             UNIQUE (company_id, monday_user_id)
         )`
     );
+
+    // Compatibility migration: some environments may have monday_user_id as INTEGER.
+    // Monday user IDs can be UUID strings, so the column must be TEXT.
+    await db.query(
+        `ALTER TABLE user_api_tokens
+         ALTER COLUMN monday_user_id TYPE TEXT
+         USING monday_user_id::text`
+    );
 }
 
 async function getStoredMondayUserApiToken({ companyId, mondayUserId }) {
