@@ -29,10 +29,10 @@ async function getCompanyByMondayAccountId(mondayAccountId) {
     const companyQuery = `
         SELECT id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date
         FROM companies
-        WHERE monday_account_id = $1
+        WHERE monday_account_id::text = $1
         LIMIT 1;
     `;
-    const companyResult = await db.query(companyQuery, [mondayAccountId]);
+    const companyResult = await db.query(companyQuery, [String(mondayAccountId)]);
     return companyResult.rows[0] || null;
 }
 
@@ -375,7 +375,7 @@ async function getStoredMondayUserApiToken({ companyId, mondayUserId }) {
         `SELECT encrypted_api_token
          FROM user_api_tokens
          WHERE company_id = $1
-           AND monday_user_id = $2
+                     AND monday_user_id::text = $2
          LIMIT 1`,
         [companyId, effectiveUserId]
     );
@@ -815,7 +815,7 @@ app.get('/api/user-api-token/:mondayAccountId', requireMondaySession, async (req
             `SELECT id
              FROM user_api_tokens
              WHERE company_id = $1
-               AND monday_user_id = $2
+                             AND monday_user_id::text = $2
              LIMIT 1`,
             [company.id, effectiveUserId]
         );
