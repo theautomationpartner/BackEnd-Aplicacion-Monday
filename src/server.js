@@ -370,7 +370,7 @@ async function getStoredMondayUserApiToken({ companyId, mondayUserId }) {
 
     await ensureUserApiTokensTable();
 
-    const effectiveUserId = String(mondayUserId || 'account_default');
+    const effectiveUserId = '0';
     const result = await db.query(
         `SELECT encrypted_api_token
          FROM user_api_tokens
@@ -810,7 +810,7 @@ app.get('/api/user-api-token/:mondayAccountId', requireMondaySession, async (req
         }
 
         await ensureUserApiTokensTable();
-        const effectiveUserId = String(req.mondayIdentity?.userId || 'account_default');
+        const effectiveUserId = '0';
         const tokenResult = await db.query(
             `SELECT id
              FROM user_api_tokens
@@ -852,7 +852,7 @@ app.post('/api/user-api-token', requireMondaySession, async (req, res) => {
         }
 
         await ensureUserApiTokensTable();
-        const effectiveUserId = String(req.mondayIdentity?.userId || 'account_default');
+        const effectiveUserId = '0';
         const encryptedToken = CryptoJS.AES.encrypt(String(api_token).trim(), process.env.ENCRYPTION_KEY).toString();
 
         await db.query(
@@ -1276,7 +1276,7 @@ app.post('/api/invoices/emit-c', requireMondaySession, async (req, res) => {
         if (pdfBuffer) {
             const mondayUserToken = await getStoredMondayUserApiToken({
                 companyId: company.id,
-                mondayUserId: req.mondayIdentity?.userId,
+                mondayUserId: null,
             });
             const invoicePdfColumnId = await getInvoicePdfColumnId({
                 companyId: company.id,
