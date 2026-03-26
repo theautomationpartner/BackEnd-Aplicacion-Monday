@@ -108,6 +108,48 @@ function ensureAccountMatch(req, res, providedAccountId) {
     return true;
 }
 
+function createDebugId(prefix = 'dbg') {
+    const random = Math.random().toString(36).slice(2, 8);
+    return `${prefix}_${Date.now()}_${random}`;
+}
+
+async function getUserTokenSchemaDiagnostics() {
+    const diagnostics = {
+        database: null,
+        db_user: null,
+        companies_monday_account_id_type: null,
+        user_api_tokens_monday_user_id_type: null,
+    };
+
+    try {
+        const dbInfoResult = await db.query('SELECT current_database() AS database, current_user AS db_user');
+        if (dbInfoResult.rows[0]) {
+            diagnostics.database = dbInfoResult.rows[0].database || null;
+            diagnostics.db_user = dbInfoResult.rows[0].db_user || null;
+        }
+
+        const columnTypesResult = await db.query(
+            `SELECT table_name, column_name, data_type
+             FROM information_schema.columns
+             WHERE table_name IN ('companies', 'user_api_tokens')
+               AND column_name IN ('monday_account_id', 'monday_user_id')`
+        );
+
+        for (const row of columnTypesResult.rows) {
+            if (row.table_name === 'companies' && row.column_name === 'monday_account_id') {
+                diagnostics.companies_monday_account_id_type = row.data_type;
+            }
+            if (row.table_name === 'user_api_tokens' && row.column_name === 'monday_user_id') {
+                diagnostics.user_api_tokens_monday_user_id_type = row.data_type;
+            }
+        }
+    } catch (diagErr) {
+        diagnostics.diagnostics_error = diagErr.message;
+    }
+
+    return diagnostics;
+}
+
 function normalizePem(rawValue, label) {
     if (!rawValue) return '';
     const trimmed = String(rawValue).trim();
@@ -832,6 +874,7 @@ app.get('/api/user-api-token-v2/:mondayAccountId', requireMondaySession, getUser
 const saveUserApiTokenHandler = async (req, res) => {
     const { monday_account_id, api_token } = req.body;
     const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+    const debugId = createDebugId('save_token');
 
     if (!accountId) {
         return res.status(400).json({ error: 'monday_account_id es obligatorio' });
@@ -848,6 +891,13 @@ const saveUserApiTokenHandler = async (req, res) => {
     }
 
     try {
+        console.log('ℹ️ saveUserApiToken start', {
+            debug_id: debugId,
+            account_id: accountId,
+            token_length: String(api_token || '').length,
+            identity_account_id: req.mondayIdentity?.accountId || null,
+        });
+
         const company = await getCompanyByMondayAccountId(accountId);
         if (!company) {
             return res.status(404).json({ error: 'Empresa no encontrada' });
@@ -867,13 +917,31 @@ const saveUserApiTokenHandler = async (req, res) => {
             [company.id, effectiveUserId, encryptedToken]
         );
 
-        return res.json({ message: 'Token de usuario guardado correctamente' });
+        console.log('✅ saveUserApiToken success', {
+            debug_id: debugId,
+            company_id: company.id,
+            effective_user_id: effectiveUserId,
+        });
+
+        return res.json({
+            message: 'Token de usuario guardado correctamente',
+            debug_id: debugId,
+        });
     } catch (err) {
-        console.error('❌ Error al guardar token de usuario monday:', err);
+        const diagnostics = await getUserTokenSchemaDiagnostics();
+        console.error('❌ Error al guardar token de usuario monday:', {
+            debug_id: debugId,
+            error_message: err.message,
+            error_code: err.code,
+            error_detail: err.detail,
+            error_where: err.where,
+            diagnostics,
+        });
         return res.status(500).json({
             error: 'Error al guardar token de usuario',
             details: err.message,
             code: err.code,
+            debug_id: debugId,
         });
     }
 };
