@@ -3,6 +3,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const CryptoJS = require('crypto-js');
+const jwt = require('jsonwebtoken');
 const serverless = require('serverless-http');
 const db = require('./db');
 require('dotenv').config();
@@ -37,6 +38,67 @@ function isMissingTableError(err) {
     return err?.code === '42P01';
 }
 
+function getSessionSecret() {
+    return process.env.MONDAY_CLIENT_SECRET || process.env.MONDAY_SIGNING_SECRET || process.env.CLIENT_SECRET;
+}
+
+function parseAuthorizationToken(req) {
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    if (!authHeader || typeof authHeader !== 'string') return null;
+    if (authHeader.toLowerCase().startsWith('bearer ')) {
+        return authHeader.slice(7).trim();
+    }
+    return authHeader.trim();
+}
+
+function extractMondayIdentity(decodedToken) {
+    const dat = decodedToken?.dat || decodedToken?.data || {};
+    const accountId = dat.account_id || decodedToken?.account_id || decodedToken?.accountId || null;
+    const userId = dat.user_id || decodedToken?.user_id || decodedToken?.userId || null;
+    return {
+        accountId: accountId ? String(accountId) : null,
+        userId: userId ? String(userId) : null,
+    };
+}
+
+function requireMondaySession(req, res, next) {
+    const secret = getSessionSecret();
+    if (!secret) {
+        return res.status(500).json({ error: 'Falta configurar MONDAY_CLIENT_SECRET en el backend' });
+    }
+
+    const token = parseAuthorizationToken(req);
+    if (!token) {
+        return res.status(401).json({ error: 'Falta Authorization Bearer sessionToken de monday' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, secret);
+        const identity = extractMondayIdentity(decoded);
+        if (!identity.accountId) {
+            return res.status(401).json({ error: 'sessionToken inválido: account_id ausente' });
+        }
+
+        req.mondayIdentity = identity;
+        return next();
+    } catch (err) {
+        return res.status(401).json({ error: 'sessionToken inválido o vencido' });
+    }
+}
+
+function ensureAccountMatch(req, res, providedAccountId) {
+    if (!req.mondayIdentity?.accountId || !providedAccountId) {
+        return false;
+    }
+
+    if (String(req.mondayIdentity.accountId) !== String(providedAccountId)) {
+        res.status(403).json({ error: 'Cuenta monday no autorizada para esta operación' });
+        return false;
+    }
+
+    return true;
+}
+
 // --- RUTAS ---
 
 app.get('/api/health', async (req, res) => {
@@ -48,9 +110,11 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
-app.get('/api/setup/:mondayAccountId', async (req, res) => {
+app.get('/api/setup/:mondayAccountId', requireMondaySession, async (req, res) => {
     const { mondayAccountId } = req.params;
     const { board_id, view_id, app_feature_id } = req.query;
+
+    if (!ensureAccountMatch(req, res, mondayAccountId)) return;
 
     console.log('🔎 setup request', {
         mondayAccountId,
@@ -165,9 +229,11 @@ app.get('/api/setup/:mondayAccountId', async (req, res) => {
     }
 });
 
-app.get('/api/board-config/:mondayAccountId', async (req, res) => {
+app.get('/api/board-config/:mondayAccountId', requireMondaySession, async (req, res) => {
     const { mondayAccountId } = req.params;
     const { board_id, view_id, app_feature_id } = req.query;
+
+    if (!ensureAccountMatch(req, res, mondayAccountId)) return;
 
     if (!board_id) {
         return res.status(400).json({ error: 'board_id es obligatorio' });
@@ -219,7 +285,7 @@ app.get('/api/board-config/:mondayAccountId', async (req, res) => {
     }
 });
 
-app.post('/api/board-config', async (req, res) => {
+app.post('/api/board-config', requireMondaySession, async (req, res) => {
     const {
         monday_account_id,
         board_id,
@@ -232,16 +298,20 @@ app.post('/api/board-config', async (req, res) => {
         required_columns
     } = req.body;
 
-    if (!monday_account_id || !board_id || !status_column_id) {
+    const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+
+    if (!accountId || !board_id || !status_column_id) {
         return res.status(400).json({ error: 'monday_account_id, board_id y status_column_id son obligatorios' });
     }
+
+    if (!ensureAccountMatch(req, res, accountId)) return;
 
     if (!Array.isArray(required_columns)) {
         return res.status(400).json({ error: 'required_columns debe ser un array' });
     }
 
     try {
-        const company = await getCompanyByMondayAccountId(String(monday_account_id));
+        const company = await getCompanyByMondayAccountId(accountId);
         if (!company) {
             return res.status(404).json({ error: 'Empresa no encontrada' });
         }
@@ -319,9 +389,11 @@ app.post('/api/board-config', async (req, res) => {
     }
 });
 
-app.get('/api/mappings/:mondayAccountId', async (req, res) => {
+app.get('/api/mappings/:mondayAccountId', requireMondaySession, async (req, res) => {
     const { mondayAccountId } = req.params;
     const { board_id, view_id, app_feature_id } = req.query;
+
+    if (!ensureAccountMatch(req, res, mondayAccountId)) return;
 
     if (!board_id) {
         return res.status(400).json({ error: 'board_id es obligatorio' });
@@ -364,7 +436,7 @@ app.get('/api/mappings/:mondayAccountId', async (req, res) => {
     }
 });
 
-app.post('/api/mappings', async (req, res) => {
+app.post('/api/mappings', requireMondaySession, async (req, res) => {
     const {
         monday_account_id,
         board_id,
@@ -374,16 +446,20 @@ app.post('/api/mappings', async (req, res) => {
         is_locked
     } = req.body;
 
-    if (!monday_account_id || !board_id) {
+    const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+
+    if (!accountId || !board_id) {
         return res.status(400).json({ error: 'monday_account_id y board_id son obligatorios' });
     }
+
+    if (!ensureAccountMatch(req, res, accountId)) return;
 
     if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
         return res.status(400).json({ error: 'mapping debe ser un objeto JSON valido' });
     }
 
     try {
-        const company = await getCompanyByMondayAccountId(String(monday_account_id));
+        const company = await getCompanyByMondayAccountId(accountId);
         if (!company) {
             return res.status(404).json({ error: 'Empresa no encontrada' });
         }
@@ -444,8 +520,16 @@ app.post('/api/mappings', async (req, res) => {
     }
 });
 
-app.post('/api/companies', async (req, res) => {
+app.post('/api/companies', requireMondaySession, async (req, res) => {
     const { monday_account_id, business_name, cuit, iva_condition, default_point_of_sale, domicilio, fecha_inicio } = req.body;
+    const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+
+    if (!accountId) {
+        return res.status(400).json({ error: 'monday_account_id es obligatorio' });
+    }
+
+    if (!ensureAccountMatch(req, res, accountId)) return;
+
     try {
         const query = `
             INSERT INTO companies (monday_account_id, business_name, cuit, iva_condition, default_point_of_sale, address, start_date)
@@ -461,7 +545,7 @@ app.post('/api/companies', async (req, res) => {
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *;
         `;
-        const result = await db.query(query, [monday_account_id, business_name, cuit, iva_condition, default_point_of_sale, domicilio, fecha_inicio]);
+        const result = await db.query(query, [accountId, business_name, cuit, iva_condition, default_point_of_sale, domicilio, fecha_inicio]);
         res.json(result.rows[0]);
     } catch (err) {
         console.error("❌ Error en DB:", err);
@@ -473,11 +557,19 @@ app.post('/api/companies', async (req, res) => {
     }
 });
 
-app.post('/api/certificates', upload.fields([
+app.post('/api/certificates', requireMondaySession, upload.fields([
     { name: 'crt', maxCount: 1 },
     { name: 'key', maxCount: 1 }
 ]), async (req, res) => {
     const { monday_account_id } = req.body;
+    const accountId = String(monday_account_id || req.mondayIdentity.accountId || '');
+
+    if (!accountId) {
+        return res.status(400).json({ error: 'monday_account_id es obligatorio' });
+    }
+
+    if (!ensureAccountMatch(req, res, accountId)) return;
+
     const files = req.files;
 
     if (!files || !files['crt'] || !files['key']) {
@@ -485,7 +577,7 @@ app.post('/api/certificates', upload.fields([
     }
 
     try {
-        const companyRes = await db.query('SELECT id FROM companies WHERE monday_account_id = $1', [monday_account_id]);
+        const companyRes = await db.query('SELECT id FROM companies WHERE monday_account_id = $1', [accountId]);
         if (companyRes.rows.length === 0) return res.status(404).json({ error: 'Empresa no encontrada' });
         
         const companyId = companyRes.rows[0].id;
